@@ -1,16 +1,36 @@
-public String extractMessageAsString(Message message) throws JMSException {
-    if (message instanceof TextMessage) {
-        return ((TextMessage) message).getText();
-    } else if (message instanceof BytesMessage) {
-        BytesMessage bytesMessage = (BytesMessage) message;
-        byte[] data = new byte[(int) bytesMessage.getBodyLength()];
-        bytesMessage.readBytes(data);
-        return new String(data);
-    } else if (message instanceof ObjectMessage) {
-        ObjectMessage objMsg = (ObjectMessage) message;
-        Object obj = objMsg.getObject();
-        return obj != null ? obj.toString() : null;
-    } else {
-        return null; // or throw exception
-    }
-}
+private void putMessageToDLQ(Message message) throws JMSException {
+		
+		
+	String MessageString =	extractMessageAsString(message);
+	String jmsCorrelationID = message.getJMSCorrelationID();
+
+		tovSenderJmsTemplate.send(zelleDlqName, new MessageCreator() {
+
+			@Override
+			public Message createMessage(Session session) throws JMSException {
+				 Message MQmessage = session.createTextMessage(MessageString);
+				 MQmessage.setJMSCorrelationID(jmsCorrelationID);
+				 MQmessage.setStringProperty("Content_Type", "application/json");
+				 MQmessage.setStringProperty("mediaType", "application/json");
+				 MQmessage.setStringProperty("DLQ_REASON", "Due to exception messages are put to DLQ..!");
+				 LOGGER.info("----------Message Published to DLQ --------------------" );
+				return MQmessage;
+			}
+
+		});
+	}
+
+ @Bean(name = "tovSenderJmsTemplate")
+	@DependsOn(value = { "cpsMQConnectionFactory" })
+	public JmsTemplate tovSenderJmsTemplate(
+			@Qualifier("tovSenderCachingConnectionFactory") CachingConnectionFactory cachingConnectionFactory) {
+		JmsTemplate jmsTemplate = new JmsTemplate(cachingConnectionFactory);
+		jmsTemplate.setReceiveTimeout(JmsDestinationAccessor.RECEIVE_TIMEOUT_NO_WAIT);
+		jmsTemplate.setExplicitQosEnabled(true);
+		jmsTemplate.setTimeToLive(1800000);
+
+		jmsTemplate.setSessionAcknowledgeMode(Session.CLIENT_ACKNOWLEDGE);
+
+		return jmsTemplate;
+
+	}
