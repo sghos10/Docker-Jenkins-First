@@ -1,278 +1,148 @@
-package com.truist.payflow.listener;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.MockitoAnnotations;
+import org.mockito.junit.MockitoJUnitRunner;
 
-import java.time.LocalDateTime;
-import java.util.Objects;
-import java.util.UUID;
-import java.util.logging.Logger;
+import javax.jms.*;
+import static org.mockito.Mockito.*;
 
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.TransientDataAccessException;
-import org.springframework.jms.core.JmsTemplate;
-import org.springframework.jms.core.MessageCreator;
-import org.springframework.jms.listener.SessionAwareMessageListener;
-import org.springframework.retry.annotation.Retryable;
-import org.springframework.stereotype.Component;
+@RunWith(MockitoJUnitRunner.class)
+public class PayflowZelleMqListenerServiceTest {
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.JsonMappingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import com.truist.payflow.dto.ZelleMQPaymentResponse;
-import com.truist.payflow.util.RtpStatusMap;
-import com.truist.pf.enums.State;
-import com.truist.pf.enums.Status;
-import com.truist.pf.event.entity.TblAuditEventStore;
-import com.truist.pf.event.repository.EventHubStoreRepository;
-import com.truist.pf.event.service.PayflowEventService;
-import com.truist.pf.model.EventStore;
-import com.truist.pf.model.GatewayResponseData;
+    @InjectMocks
+    private PayflowZelleMqListenerService listenerService;
 
-import com.truist.pf.model.PayflowStatus;
-import org.springframework.retry.annotation.Backoff;
-import org.springframework.retry.annotation.Recover;
+    @Mock
+    private PayflowEventService payflowEventService;
 
-import jakarta.jms.BytesMessage;
-import jakarta.jms.Destination;
-import jakarta.jms.JMSException;
-import jakarta.jms.Message;
-import jakarta.jms.ObjectMessage;
-import jakarta.jms.Session;
-import jakarta.jms.TextMessage;
+    @Mock
+    private JmsTemplate jmsTemplate;
 
-@Component
-//@RequiredArgsConstructor
-public class PayflowZelleMqListenerService implements SessionAwareMessageListener {
+    @Mock
+    private Session session;
 
-	private static final Logger LOGGER = Logger.getLogger(PayflowZelleMqListenerService.class.getName());
+    @Mock
+    private TextMessage textMessage;
 
-	private static final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule())
-			.configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
-			.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    @Before
+    public void setUp() throws Exception {
+        MockitoAnnotations.initMocks(this);
+        // enable DLQ for most tests
+        org.springframework.test.util.ReflectionTestUtils.setField(listenerService, "DLQEnabled", true);
+    }
 
-	// @Autowired(required = true)
-	private final PayflowEventService payflowEventService;
+    @Test
+    public void testHappyPath_Sent() throws Exception {
+        when(textMessage.getText()).thenReturn("payload");
 
-	private EventHubStoreRepository eventStoreRepository;
+        EventStore store = new EventStore();
+        store.setUETR("123");
+        store.setPaymentStatus("Sent");
 
-	@Value("${tov.mq.tovSenderQueueName}")
-	private String tovSenderQueueName;
+        GatewayResponseData resp = new GatewayResponseData();
+        resp.setEventStore(store);
 
-	@Value("${cps.mq.zelleDlqName}")
-	private String zelleDlqName;
+        when(payflowEventService.updateEventFromGateWay(anyString())).thenReturn(resp);
 
-	@Value("${cps.mq.dlqEnabled}")
-	private boolean DLQEnabled;
+        listenerService.onMessage(textMessage, session);
 
-	/*
-	 * @Autowired
-	 * 
-	 * @Qualifier("tovSenderJmsTemplate")
-	 */
-	JmsTemplate tovSenderJmsTemplate;
+        verify(jmsTemplate).send(eq("TOV_QUEUE"), any());
+    }
 
-	// @Autowired
-	RtpStatusMap rtpStatusMap;
+    @Test
+    public void testNullEventStore() throws Exception {
+        when(textMessage.getText()).thenReturn("payload");
+        when(payflowEventService.updateEventFromGateWay(anyString())).thenReturn(null);
 
-	public PayflowZelleMqListenerService(PayflowEventService payflowEventService,
-			EventHubStoreRepository eventStoreRepository, JmsTemplate tovSenderJmsTemplate, RtpStatusMap rtpStatusMap) {
-		super();
-		this.payflowEventService = payflowEventService;
-		this.eventStoreRepository = eventStoreRepository;
-		this.tovSenderJmsTemplate = tovSenderJmsTemplate;
-		this.rtpStatusMap = rtpStatusMap;
-	}
+        listenerService.onMessage(textMessage, session);
 
-	@Override
-	@Retryable(value = { JMSException.class,
-			TransientDataAccessException.class }, maxAttempts = 1, backoff = @Backoff(delay = 1000)
+        verify(jmsTemplate).send(eq("DLQ_QUEUE"), any());
+    }
 
-	)
-	public void onMessage(Message message, Session session) throws JMSException {
-		LOGGER.info("response message: " + message);
-		TextMessage txt = null;
-		ZelleMQPaymentResponse zellePaymentResponse = null;
-		EventStore convertToEventStore = null;
-		GatewayResponseData updateEventFromGateWay = null;
+    @Test
+    public void testNullUETR() throws Exception {
+        when(textMessage.getText()).thenReturn("payload");
 
-		try {
-			txt = (TextMessage) message;
-			LOGGER.info(txt.getText());
-			zellePaymentResponse = objectMapper.readValue(txt.getText(), ZelleMQPaymentResponse.class);
+        EventStore store = new EventStore();
+        store.setUETR(null);
+        store.setPaymentStatus("Sent");
 
-			LOGGER.info("ResponseQueue Entry in Gateway ");
+        GatewayResponseData resp = new GatewayResponseData();
+        resp.setEventStore(store);
 
-			convertToEventStore = ConvertToEventStore(zellePaymentResponse);
+        when(payflowEventService.updateEventFromGateWay(anyString())).thenReturn(resp);
 
-			try {
-				updateEventFromGateWay = payflowEventService.updateEventFromGateWay(convertToEventStore);
-			} catch (Exception e) {
+        listenerService.onMessage(textMessage, session);
 
-				throw new Exception();
+        verify(jmsTemplate).send(eq("DLQ_QUEUE"), any());
+    }
 
-			}
-			String writeValueAsString = objectMapper.writeValueAsString(zellePaymentResponse);
+    @Test
+    public void testErrorCode() throws Exception {
+        when(textMessage.getText()).thenReturn("payload");
 
-			pushToTOVQueue(writeValueAsString, convertToEventStore.getUETR());
+        EventStore store = new EventStore();
+        store.setUETR("123");
+        store.setPaymentStatus("Sent");
 
-			LOGGER.info(" --exit Gateway -- ");
-		} catch (JsonProcessingException e) {
+        GatewayResponseData resp = new GatewayResponseData();
+        resp.setEventStore(store);
+        resp.setErrorCode("ERR01");
 
-			putMessageToDLQ(message);
+        when(payflowEventService.updateEventFromGateWay(anyString())).thenReturn(resp);
 
-		} catch (TransientDataAccessException e) {
+        listenerService.onMessage(textMessage, session);
 
-			throw e;
+        verify(jmsTemplate).send(eq("DLQ_QUEUE"), any());
+    }
 
-		} catch (JMSException e) {
+    @Test
+    public void testRejectedStatus() throws Exception {
+        when(textMessage.getText()).thenReturn("payload");
 
-			throw new JMSException("JMS Exception Occured..!");
-		} catch (Exception e) {
+        EventStore store = new EventStore();
+        store.setUETR("123");
+        store.setPaymentStatus("Rejected");
 
-			putMessageToDLQ(message);
+        GatewayResponseData resp = new GatewayResponseData();
+        resp.setEventStore(store);
 
-		}
+        when(payflowEventService.updateEventFromGateWay(anyString())).thenReturn(resp);
 
-	} 
+        listenerService.onMessage(textMessage, session);
 
-	/**
-	 * To push meesage in TOV queue
-	 * 
-	 * @param tovMessage
-	 * @param correlationID
-	 */
-	private void pushToTOVQueue(String tovMessage, String correlationID) {
-		tovSenderJmsTemplate.send(tovSenderQueueName, new MessageCreator() {
+        verify(jmsTemplate).send(eq("DLQ_QUEUE"), any());
+    }
 
-			@Override
-			public Message createMessage(Session session) throws JMSException {
-				LOGGER.info("Start : publishing to Tov MQ ");
-				Message message = session.createTextMessage(tovMessage);
-				message.setJMSCorrelationID(correlationID);
-				message.setStringProperty("Content_Type", "application/json");
-				message.setStringProperty("mediaType", "application/json");
+    @Test
+    public void testInvalidMessageType() throws Exception {
+        ObjectMessage objectMessage = mock(ObjectMessage.class);
 
-				TextMessage muleRequest = (TextMessage) message;
-				LOGGER.info("End : Published To TOV MQ : " + tovSenderQueueName + message.toString());
-				return message;
+        listenerService.onMessage(objectMessage, session);
 
-			}
-		});
-	}
+        verify(jmsTemplate).send(eq("DLQ_QUEUE"), any());
+    }
 
-	@Recover
-	public void recover(Exception e, Message message, Session session) throws JMSException {
+    @Test
+    public void testExceptionHandling() throws Exception {
+        when(textMessage.getText()).thenThrow(new JMSException("Boom"));
 
-		putMessageToDLQ(message);
-		LOGGER.info("End : Published To DLQ");
+        listenerService.onMessage(textMessage, session);
 
-	}
+        verify(jmsTemplate).send(eq("DLQ_QUEUE"), any());
+    }
 
-	private void putMessageToDLQ(Message message) throws JMSException {
+    @Test
+    public void testDLQDisabled_NoSend() throws Exception {
+        org.springframework.test.util.ReflectionTestUtils.setField(listenerService, "DLQEnabled", false);
 
-		if(DLQEnabled) { 
-		
-		
-		String MessageString = extractMessageAsString(message);
-		String jmsCorrelationID = message.getJMSCorrelationID();
+        when(textMessage.getText()).thenThrow(new JMSException("Boom"));
 
-		tovSenderJmsTemplate.send(zelleDlqName, new MessageCreator() {
+        listenerService.onMessage(textMessage, session);
 
-			@Override
-			public Message createMessage(Session session) throws JMSException {
-				Message MQmessage = session.createTextMessage(MessageString);
-				MQmessage.setJMSCorrelationID(jmsCorrelationID);
-				MQmessage.setStringProperty("Content_Type", "application/json");
-				MQmessage.setStringProperty("mediaType", "application/json");
-				MQmessage.setStringProperty("DLQ_REASON", "Due to exception messages are put to DLQ..!");
-				LOGGER.info("----------Message Published to DLQ --------------------");
-				return MQmessage;
-			}
-
-		});
-		
-		}
-		else {
-			
-			LOGGER.info("----------Message not Published to DLQ --------------------");
-			
-		}
-	}
-
-	private EventStore ConvertToEventStore(ZelleMQPaymentResponse response) {
-		// TODO Auto-generated method stub
-
-		EventStore eventStore = new EventStore();
-
-		eventStore.setUpdatedTimestamp(LocalDateTime.now());
-
-		if (Objects.nonNull(response)) {
-			if (Objects.nonNull(response.getMetaData())) {
-				if (Objects.nonNull(response.getMetaData().getUETR())) {
-					eventStore.setTransactionId(response.getMetaData().getUETR());
-					eventStore.setUETR(response.getMetaData().getUETR());
-				}
-				if (Objects.nonNull(response.getMetaData().getPaymentStatus())) {
-					String paymentStatus = paymentStatus(response.getMetaData().getPaymentStatus());
-					if (Objects.nonNull(paymentStatus)) {
-						Status statusEnum = Status.fromString(paymentStatus);
-						if (Objects.nonNull(statusEnum)) {
-							eventStore.setStatus(statusEnum);
-						}
-					}
-				}
-			}
-			if (Objects.nonNull(response.getErrorCode())) {
-				eventStore.setReasonCd(response.getErrorCode());
-			}
-			if (Objects.nonNull(response.getErrorDescription())) {
-				eventStore.setReasonDesc(response.getErrorDescription());
-			}
-		}
-//		eventStore.setStatus(
-//				response.getMetaData().getPaymentStatus().equals("Sent")
-//						? Status.PAYMENT_COMPLETED :
-//								response.getMetaData().getPaymentStatus().equals("Delivered") 
-//								? Status.PAYMENT_COMPLETED :
-//										response.getMetaData().getPaymentStatus().equals("Failed")
-//										? Status.PAYMENT_REJECTED :
-//												response.getMetaData().getPaymentStatus().equals("Denied")
-//												? Status.PAYMENT_REJECTED :
-//														response.getMetaData().getPaymentStatus().equals("Hold")
-//														? Status.IN_PROGRESS :
-//																response.getMetaData().getPaymentStatus().equals("PENDING")
-//																? Status.IN_PROGRESS
-//																		: null);
-		return eventStore;
-
-	}
-
-	public String paymentStatus(String paymentStatus) {
-		String upperCaseStatus = "";
-		if (Objects.nonNull(paymentStatus)) {
-			upperCaseStatus = paymentStatus.trim().toUpperCase();
-		}
-		return upperCaseStatus;
-	}
-
-	public String extractMessageAsString(Message message) throws JMSException {
-		if (message instanceof TextMessage) {
-			return ((TextMessage) message).getText();
-		} else if (message instanceof BytesMessage) {
-			BytesMessage bytesMessage = (BytesMessage) message;
-			byte[] data = new byte[(int) bytesMessage.getBodyLength()];
-			bytesMessage.readBytes(data);
-			return new String(data);
-		} else if (message instanceof ObjectMessage) {
-			ObjectMessage objMsg = (ObjectMessage) message;
-			Object obj = objMsg.getObject();
-			return obj != null ? obj.toString() : null;
-		} else {
-			return null; // or throw exception } }
-		}
-	}
-
+        verify(jmsTemplate, never()).send(eq("DLQ_QUEUE"), any());
+    }
 }
